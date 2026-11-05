@@ -1,448 +1,779 @@
-import warnings 
-warnings.simplefilter(action='ignore', category=FutureWarning)
-warnings.simplefilter(action='ignore', category=UserWarning)
-import pandas as pd
-from datetime import datetime as dt
 import os
+from pathlib import Path
+
+import pandas as pd
 import requests
 from dotenv import load_dotenv
 
-
-# This is a script for parsing an excel workplan and adding the information into a new trello board. 
-
+# Parse an Excel workplan and use it to create a Trello board.
 load_dotenv()
+
 API_KEY = os.getenv("TRELLO_API_KEY")
 TOKEN = os.getenv("TRELLO_TOKEN")
 WORKSPACE_ID = os.getenv("WORKSPACE_ID")
 
+required_environment_variables = {
+    "TRELLO_API_KEY": API_KEY,
+    "TRELLO_TOKEN": TOKEN,
+    "WORKSPACE_ID": WORKSPACE_ID,
+}
 
-# Path to the excel workplan. Change this to match the location for you own workplan. 
-# workplan_file = r"C:\Users\tpeterschmidt\Documents\Work Plan RMPC-FishReg.xlsx"
-workplan_file = r"C:\Users\tpeterschmidt\Documents\Test_workplan_copy.xlsx"
+missing_environment_variables = [
+    name
+    for name, value in required_environment_variables.items()
+    if not value
+]
 
-# Change the sheet_name to match the name of your sheet.
-workplan_df = pd.read_excel(workplan_file, sheet_name="Test Trello Version")
-
-# print("found the workplan", workplan_df.shape[0], "rows")
-
-# Parsing out the different workplan elements. These will be used to create the trello baord, add the board members, and create the lists. 
-new_board_name = workplan_df["BOARD NAME"].iloc[0]
-
-new_board_members = workplan_df["BOARD MEMBERS"].iloc[0].split(", ")
-# new_board_members = ["Teddy Peterschmidt"]
+if missing_environment_variables:
+    raise EnvironmentError(
+        "Missing required environment variable(s): "
+        + ", ".join(missing_environment_variables)
+    )
 
 
-new_lists = workplan_df["LIST NAME"].unique()
+# Configure the source workbook and worksheet.
+workplan_file = Path(
+    os.getenv(
+        "WORKPLAN_FILE",
+        r"C:\Users\tpeterschmidt\Documents\Test_workplan_copy.xlsx",
+    )
+)
+sheet_name = os.getenv("WORKPLAN_SHEET", "Test Trello Version")
 
-new_cards = workplan_df["CARD NAME"].unique()
+if not workplan_file.is_file():
+    raise FileNotFoundError(f"Workplan file not found: {workplan_file}")
 
-# ==============================================================================================
-# Creating the board.
-# ==============================================================================================
+workplan_df = pd.read_excel(workplan_file, sheet_name=sheet_name)
 
-# Get existing boards in the workspace to check if the board already exsits.
-response = requests.get(
-    "https://api.trello.com/1/organizations/{}/boards".format(WORKSPACE_ID),
-    params={
-        "key": API_KEY,
-        "token": TOKEN
-    },
+if workplan_df.empty:
+    raise ValueError(
+        f"The worksheet '{sheet_name}' in '{workplan_file.name}' contains no rows."
+    )
+
+print(f"Loaded {len(workplan_df)} workplan row(s) from '{sheet_name}'.")
+
+# Check that all required columns are present.
+
+required_columns = [
+    "BOARD NAME",
+    "BOARD MEMBERS",
+    "LIST NAME",
+    "CARD NAME",
+    "CARD LABEL",
+    "CARD LABEL COLOR",
+    "CARD MEMBERS",
+    "CARD START DATE",
+    "CARD END DATE",
+    "CHECKLIST ITEM DESCRIPTION",
+    "CHECKLIST ITEM DUE DATE",
+    "CHECKLIST ITEM ASSIGNMENT",
+]
+
+missing_columns = [
+    column
+    for column in required_columns
+    if column not in workplan_df.columns
+]
+
+if missing_columns:
+    raise ValueError(
+        "The workplan is missing required column(s): "
+        + ", ".join(missing_columns)
+    )
+
+# Extract board-level information from the first workplan row.
+first_row = workplan_df.iloc[0]
+
+board_name_value = first_row["BOARD NAME"]
+
+if pd.isna(board_name_value) or not str(board_name_value).strip():
+    raise ValueError("The first row must include a BOARD NAME.")
+
+new_board_name = str(board_name_value).strip()
+
+board_members_value = first_row["BOARD MEMBERS"]
+
+if pd.isna(board_members_value) or not str(board_members_value).strip():
+    new_board_members = []
+else:
+    new_board_members = [
+        member.strip()
+        for member in str(board_members_value).split(",")
+        if member.strip()
+    ]
+
+
+# Extract unique, non-blank list names.
+list_names = (
+    workplan_df["LIST NAME"]
+    .dropna()
+    .astype(str)
+    .str.strip()
 )
 
-response.raise_for_status()
+new_lists = list_names[list_names.ne("")].unique().tolist()
 
-existing_board_names = {
-    board["name"]: board["id"]
+if not new_lists:
+    raise ValueError("The workplan must include at least one non-blank LIST NAME.")
+
+# ==============================================================================================
+# Create or find the board.
+# ==============================================================================================
+
+TRELLO_API_BASE = "https://api.trello.com/1"
+TRELLO_AUTH = {
+    "key": API_KEY,
+    "token": TOKEN,
+}
+
+
+def normalize_name(value):
+    return str(value).strip().casefold()
+
+
+try:
+    response = requests.get(
+        f"{TRELLO_API_BASE}/organizations/{WORKSPACE_ID}/boards",
+        params=TRELLO_AUTH,
+        timeout=30,
+    )
+    response.raise_for_status()
+except requests.RequestException as error:
+    raise RuntimeError("Unable to retrieve existing Trello boards.") from error
+
+existing_board_ids = {
+    normalize_name(board["name"]): board["id"]
     for board in response.json()
 }
 
-# If the board already exists, use the existing board moving forward. If not, create the new board and use the new board.
-if new_board_name in existing_board_names:
-    board_id = existing_board_names[new_board_name]
-    print(f"A board with the name '{new_board_name}' already exists.")
+normalized_board_name = normalize_name(new_board_name)
+
+if normalized_board_name in existing_board_ids:
+    board_id = existing_board_ids[normalized_board_name]
+    print(f"Using existing board '{new_board_name}'.")
 else:
-    response = requests.post(
-        "https://api.trello.com/1/boards/",
-        params={
-            "name": new_board_name,
-            "key": API_KEY,
-            "token": TOKEN,
-            "idOrganization": WORKSPACE_ID,
-            "defaultLists": "false"
-        },
-    )
-    response.raise_for_status()
+    try:
+        response = requests.post(
+            f"{TRELLO_API_BASE}/boards",
+            params={
+                **TRELLO_AUTH,
+                "name": new_board_name,
+                "idOrganization": WORKSPACE_ID,
+                "defaultLists": "false",
+            },
+            timeout=30,
+        )
+        response.raise_for_status()
+    except requests.RequestException as error:
+        raise RuntimeError(
+            f"Unable to create Trello board '{new_board_name}'."
+        ) from error
 
     board_id = response.json()["id"]
-    print(f"Created a new board with the name '{new_board_name}'.")
+    print(f"Created board '{new_board_name}'.")
 
 # ==============================================================================================
-# Adding members to the board.
+# Add members to the board.
 # ==============================================================================================
 
-# Getting all member of the workspace and creating a dictionary with names nad member_ids.
-response = requests.get(
-    f"https://api.trello.com/1/organizations/{WORKSPACE_ID}/members",
-    params={
-        "key": API_KEY,
-        "token": TOKEN
-    }
-)
-response.raise_for_status()
+try:
+    response = requests.get(
+        f"{TRELLO_API_BASE}/organizations/{WORKSPACE_ID}/members",
+        params=TRELLO_AUTH,
+        timeout=30,
+    )
+    response.raise_for_status()
+except requests.RequestException as error:
+    raise RuntimeError("Unable to retrieve workspace members.") from error
 
-members = response.json()
+workspace_members_by_name = {
+    normalize_name(member["fullName"]): member["id"]
+    for member in response.json()
+    if member.get("fullName")
+}
 
-# A dictionary of member names and the associated id to check against. 
-member_dict = {member["fullName"].lower().strip(): member["id"] for member in members}
-
-# Check what members are already on the board to avoid adding duplicates.
-response = requests.get(
-    f"https://api.trello.com/1/boards/{board_id}/members",
-    params={
-        "key": API_KEY,
-        "token": TOKEN
-    }
-)
-response.raise_for_status()
-
-board_members = response.json()
+try:
+    response = requests.get(
+        f"{TRELLO_API_BASE}/boards/{board_id}/members",
+        params=TRELLO_AUTH,
+        timeout=30,
+    )
+    response.raise_for_status()
+except requests.RequestException as error:
+    raise RuntimeError(
+        f"Unable to retrieve members for board '{new_board_name}'."
+    ) from error
 
 existing_board_member_ids = {
     member["id"]
-    for member in board_members
+    for member in response.json()
 }
 
-# Loop through the list of new board members and add them to the board 
-for member in new_board_members:
-    member_id = member_dict.get(member.lower().strip())
+for member_name in new_board_members:
+    member_id = workspace_members_by_name.get(normalize_name(member_name))
 
     if member_id is None:
-        print(f"Member '{member}' not found in the workspace. Skipping.")
+        print(f"Member '{member_name}' was not found in the workspace. Skipping.")
         continue
 
     if member_id in existing_board_member_ids:
-        print(f"Member '{member}' is already on the board.")
+        print(f"Member '{member_name}' is already on the board.")
         continue
 
-    response = requests.put(
-        f"https://api.trello.com/1/boards/{board_id}/members/{member_id}",
-        params={
-            "key": API_KEY,
-            "token": TOKEN,
-            "type": "normal"
-        },
-    )
-
-    response.raise_for_status()
-
-    print(f"Added member '{member}' to the board.")
+    try:
+        response = requests.put(
+            f"{TRELLO_API_BASE}/boards/{board_id}/members/{member_id}",
+            params={
+                **TRELLO_AUTH,
+                "type": "normal",
+            },
+            timeout=30,
+        )
+        response.raise_for_status()
+    except requests.RequestException as error:
+        raise RuntimeError(
+            f"Unable to add member '{member_name}' to board '{new_board_name}'."
+        ) from error
 
     existing_board_member_ids.add(member_id)
+    print(f"Added member '{member_name}' to the board.")
 
 # ==============================================================================================
-# Creating the labels.
+# Create labels.
 # ==============================================================================================
 
-label_df = workplan_df[["CARD LABEL", "CARD LABEL COLOR"]].dropna().drop_duplicates()
-
-label_definitions = {
-    row["CARD LABEL"]: row["CARD LABEL COLOR"].lower().strip()
-    for _, row in label_df.iterrows()
+TRELLO_LABEL_COLORS = {
+    "yellow",
+    "purple",
+    "blue",
+    "red",
+    "green",
+    "orange",
+    "black",
+    "sky",
+    "pink",
+    "lime",
 }
 
-# Get the list of labels already on the board to avoid creating duplicates.
-response = requests.get(
-    f"https://api.trello.com/1/boards/{board_id}/labels",
-    params={
-        "key": API_KEY,
-        "token": TOKEN
-    }
-)
-response.raise_for_status()
+label_definitions = {}
 
-existing_labels_dict = {label["name"].lower(): label["id"] for label in response.json()}
+for row_number, row in workplan_df.iterrows():
+    label_name = row["CARD LABEL"]
+    label_color = row["CARD LABEL COLOR"]
 
-label_dict = existing_labels_dict.copy()
-
-# Loop through new labels and add the new ones to the board 
-for name, color in label_definitions.items():
-    key = name.lower().strip()
-
-    if key in existing_labels_dict:
-        print(f"A label with the name '{name}' already exists on the board.")
+    if pd.isna(label_name) and pd.isna(label_color):
         continue
 
-    response = requests.post(
-        f"https://api.trello.com/1/boards/{board_id}/labels",
-        params={
-            "key": API_KEY,
-            "token": TOKEN,
-            "name": name,
-            "color": color
-        }
+    if pd.isna(label_name) or not str(label_name).strip():
+        raise ValueError(
+            f"Row {row_number + 2}: CARD LABEL COLOR is set, but CARD LABEL is blank."
+        )
+
+    if pd.isna(label_color) or not str(label_color).strip():
+        raise ValueError(
+            f"Row {row_number + 2}: CARD LABEL is set, but CARD LABEL COLOR is blank."
+        )
+
+    label_name = str(label_name).strip()
+    label_color = str(label_color).strip().lower()
+    label_key = normalize_name(label_name)
+
+    if label_color not in TRELLO_LABEL_COLORS:
+        allowed_colors = ", ".join(sorted(TRELLO_LABEL_COLORS))
+        raise ValueError(
+            f"Row {row_number + 2}: '{label_color}' is not a valid Trello label "
+            f"color. Use one of: {allowed_colors}."
+        )
+
+    if (
+        label_key in label_definitions
+        and label_definitions[label_key]["color"] != label_color
+    ):
+        raise ValueError(
+            f"Label '{label_name}' is assigned more than one color in the workplan."
+        )
+
+    label_definitions[label_key] = {
+        "name": label_name,
+        "color": label_color,
+    }
+
+
+try:
+    response = requests.get(
+        f"{TRELLO_API_BASE}/boards/{board_id}/labels",
+        params=TRELLO_AUTH,
+        timeout=30,
     )
     response.raise_for_status()
+except requests.RequestException as error:
+    raise RuntimeError(
+        f"Unable to retrieve labels for board '{new_board_name}'."
+    ) from error
 
-    label_dict[key] = response.json()["id"]
-
-    print(f"✅ Created label '{name}' ({color})")
-
-# ==============================================================================================
-# Creating the lists.
-# ==============================================================================================
-
-# Check the board for any existing lists to avoid creating duplicates. 
-response = requests.get(
-    f"https://api.trello.com/1/boards/{board_id}/lists",
-    params={
-        "key": API_KEY,
-        "token": TOKEN
-    }
-)
-response.raise_for_status()
-existing_list_names = {lst["name"] for lst in response.json()}
-
-# If the list already exists, do not create a duplicate. If not, create the new list from the workplan.
-for name in new_lists:
-    if name in existing_list_names:
-        print(f"A list with the name '{name}' already exists on the board.")
-        continue
-
-    response = requests.post (
-        "https://api.trello.com/1/lists",
-        params={
-            "key": API_KEY,
-            "token": TOKEN,
-            "idBoard": board_id,
-            "name": name
-        }   ,
-    )
-    response.raise_for_status()
-    print(f"Created a new list with the name '{name}' on the board.")
-
-# ==============================================================================================
-# Creating the cards. 
-# ==============================================================================================
-
-# Get all the lists on the board to get the list ids for creating the cards.
-response = requests.get(
-    f"https://api.trello.com/1/boards/{board_id}/lists",
-    params={
-        "key": API_KEY,
-        "token": TOKEN
-    }
-)
-response.raise_for_status()
-
-lists = response.json()
-
-# Create a dictionary of lists and the associated ids. Used later to assign cards to the correct list. 
-list_dict = {lst["name"].lower().strip(): lst["id"] for lst in lists}
-
-# Get a list of all the cards on the board to avoid creating duplicates.
-response = requests.get(
-    f"https://api.trello.com/1/boards/{board_id}/cards",
-    params={
-        "key": API_KEY,
-        "token": TOKEN
-    }
-)
-response.raise_for_status()
-
-cards = response.json()
-
-# A dictionary of cards and the associated IDs. 
-card_dict = {
-    card["name"].lower(): card["id"]
-    for card in cards 
+label_dict = {
+    normalize_name(label["name"]): label["id"]
+    for label in response.json()
+    if label.get("name")
 }
 
-existing_cards = {
-    (card["idList"], card["name"].lower())
-    for card in cards}
+for label_key, definition in label_definitions.items():
+    label_name = definition["name"]
+    label_color = definition["color"]
 
-# Loop through the rows of cards in the workplan and create the cards on the trello board. 
-
-for _, row in workplan_df.iterrows():
-    list_name = row["LIST NAME"]
-    card_name = row["CARD NAME"].strip()
-    members_raw = row["CARD MEMBERS"]
-
-    if pd.isna(list_name) or pd.isna(card_name):
+    if label_key in label_dict:
+        print(f"Using existing label '{label_name}'.")
         continue
 
-    list_id = list_dict.get(list_name.lower().strip())
+    try:
+        response = requests.post(
+            f"{TRELLO_API_BASE}/boards/{board_id}/labels",
+            params={
+                **TRELLO_AUTH,
+                "name": label_name,
+                "color": label_color,
+            },
+            timeout=30,
+        )
+        response.raise_for_status()
+    except requests.RequestException as error:
+        raise RuntimeError(
+            f"Unable to create label '{label_name}' on board '{new_board_name}'."
+        ) from error
+
+    label_dict[label_key] = response.json()["id"]
+    print(f"Created label '{label_name}' ({label_color}).")
+
+# ==============================================================================================
+# Create lists.
+# ==============================================================================================
+
+try:
+    response = requests.get(
+        f"{TRELLO_API_BASE}/boards/{board_id}/lists",
+        params=TRELLO_AUTH,
+        timeout=30,
+    )
+    response.raise_for_status()
+except requests.RequestException as error:
+    raise RuntimeError(
+        f"Unable to retrieve lists for board '{new_board_name}'."
+    ) from error
+
+list_dict = {}
+
+for trello_list in response.json():
+    list_key = normalize_name(trello_list["name"])
+
+    if list_key in list_dict:
+        raise RuntimeError(
+            f"The board '{new_board_name}' has multiple lists named "
+            f"'{trello_list['name']}'. Rename or remove the duplicates before "
+            "running this script."
+        )
+
+    list_dict[list_key] = trello_list["id"]
+
+for list_name in new_lists:
+    list_key = normalize_name(list_name)
+
+    if list_key in list_dict:
+        print(f"Using existing list '{list_name}'.")
+        continue
+
+    try:
+        response = requests.post(
+            f"{TRELLO_API_BASE}/lists",
+            params={
+                **TRELLO_AUTH,
+                "idBoard": board_id,
+                "name": list_name,
+            },
+            timeout=30,
+        )
+        response.raise_for_status()
+    except requests.RequestException as error:
+        raise RuntimeError(
+            f"Unable to create list '{list_name}' on board '{new_board_name}'."
+        ) from error
+
+    list_dict[list_key] = response.json()["id"]
+    print(f"Created list '{list_name}'.")
+
+# ==============================================================================================
+# Create cards.
+# ==============================================================================================
+
+def to_trello_timestamp(value, row_number, column_name):
+    if pd.isna(value) or not str(value).strip():
+        return None
+
+    timestamp = pd.to_datetime(value, errors="coerce")
+
+    if pd.isna(timestamp):
+        raise ValueError(
+            f"Row {row_number}: '{value}' is not a valid {column_name}."
+        )
+
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.tz_localize("UTC")
+    else:
+        timestamp = timestamp.tz_convert("UTC")
+
+    return timestamp.isoformat().replace("+00:00", "Z")
+
+
+try:
+    response = requests.get(
+        f"{TRELLO_API_BASE}/boards/{board_id}/cards",
+        params=TRELLO_AUTH,
+        timeout=30,
+    )
+    response.raise_for_status()
+except requests.RequestException as error:
+    raise RuntimeError(
+        f"Unable to retrieve cards for board '{new_board_name}'."
+    ) from error
+
+card_ids_by_location = {}
+
+for card in response.json():
+    card_key = (
+        card["idList"],
+        normalize_name(card["name"]),
+    )
+
+    if card_key in card_ids_by_location:
+        raise RuntimeError(
+            f"The board has multiple cards named '{card['name']}' "
+            "in the same list. Rename or remove the duplicates before running "
+            "this script."
+        )
+
+    card_ids_by_location[card_key] = card["id"]
+
+
+for row_number, row in workplan_df.iterrows():
+    spreadsheet_row = row_number + 2
+
+    list_name_value = row["LIST NAME"]
+    card_name_value = row["CARD NAME"]
+
+    has_list_name = (
+        pd.notna(list_name_value) and str(list_name_value).strip()
+    )
+    has_card_name = (
+        pd.notna(card_name_value) and str(card_name_value).strip()
+    )
+
+    if not has_list_name and not has_card_name:
+        continue
+
+    if not has_list_name or not has_card_name:
+        raise ValueError(
+            f"Row {spreadsheet_row}: LIST NAME and CARD NAME must both be provided."
+        )
+
+    list_name = str(list_name_value).strip()
+    card_name = str(card_name_value).strip()
+    list_id = list_dict.get(normalize_name(list_name))
 
     if list_id is None:
-        print(f"List '{list_name}' not found. Skipping '{card_name}'.")
+        raise ValueError(
+            f"Row {spreadsheet_row}: list '{list_name}' could not be found."
+        )
+
+    card_key = (list_id, normalize_name(card_name))
+
+    if card_key in card_ids_by_location:
+        print(f"Using existing card '{card_name}' in '{list_name}'.")
         continue
 
-    if (list_id, card_name.lower()) in existing_cards:
-        print(f"Card '{card_name}' already exists in '{list_name}'. Skipping.")
-        continue
+    members_raw = row["CARD MEMBERS"]
 
-    # MEMBER HANDLING
-    if pd.notna(members_raw):
-        member_names = [n.strip().lower() for n in members_raw.split(",")]
+    if pd.isna(members_raw) or not str(members_raw).strip():
+        member_ids = []
     else:
-        member_names = []
+        member_ids = []
 
-    member_ids = [
-        member_dict[name]
-        for name in member_names
-        if name in member_dict
-    ]
+        for member_name in str(members_raw).split(","):
+            member_name = member_name.strip()
 
-    # DATE HANDLING
-    start_date_raw = pd.to_datetime(row["CARD START DATE"], errors="coerce")
-    end_date_raw = pd.to_datetime(row["CARD END DATE"], errors="coerce")
+            if not member_name:
+                continue
 
-    def to_iso(dt):
-        if pd.isna(dt):
-            return None
-        if dt.tzinfo is None:
-            dt = dt.tz_localize("UTC")
-        return dt.isoformat().replace("+00:00", "Z")
+            member_id = workspace_members_by_name.get(
+                normalize_name(member_name)
+            )
 
-    start_date = to_iso(start_date_raw)
-    end_date = to_iso(end_date_raw)
+            if member_id is None:
+                print(
+                    f"Row {spreadsheet_row}: card member '{member_name}' "
+                    "was not found in the workspace. Skipping that assignment."
+                )
+                continue
 
-    # LABEL
+            member_ids.append(member_id)
+
+    start_date = to_trello_timestamp(
+        row["CARD START DATE"],
+        spreadsheet_row,
+        "CARD START DATE",
+    )
+    due_date = to_trello_timestamp(
+        row["CARD END DATE"],
+        spreadsheet_row,
+        "CARD END DATE",
+    )
+
     label_value = row["CARD LABEL"]
     label_id = None
 
-    if pd.notna(label_value):
-        label_id = label_dict.get(label_value.lower().strip())
+    if pd.notna(label_value) and str(label_value).strip():
+        label_name = str(label_value).strip()
+        label_id = label_dict.get(normalize_name(label_name))
 
-    # BUILD PARAMS CLEANLY
-    params = {
-        "key": API_KEY,
-        "token": TOKEN,
+        if label_id is None:
+            raise ValueError(
+                f"Row {spreadsheet_row}: label '{label_name}' was not found."
+            )
+
+    card_params = {
+        **TRELLO_AUTH,
         "idList": list_id,
         "name": card_name,
-        "start": start_date,
-        "due": end_date,
-        "dueReminder": 120
     }
 
     if member_ids:
-        params["idMembers"] = ",".join(member_ids)
+        card_params["idMembers"] = ",".join(member_ids)
+
+    if start_date:
+        card_params["start"] = start_date
+
+    if due_date:
+        card_params["due"] = due_date
+        card_params["dueReminder"] = 120
 
     if label_id:
-        params["idLabels"] = label_id
+        card_params["idLabels"] = label_id
 
-    # CREATE CARD
-    response = requests.post(
-        "https://api.trello.com/1/cards",
-        params=params
-    )
-    response.raise_for_status()
+    try:
+        response = requests.post(
+            f"{TRELLO_API_BASE}/cards",
+            params=card_params,
+            timeout=30,
+        )
+        response.raise_for_status()
+    except requests.RequestException as error:
+        raise RuntimeError(
+            f"Unable to create card '{card_name}' in list '{list_name}'."
+        ) from error
 
-    card_id = response.json()["id"]
-
-    # CREATE CHECKLIST
-    requests.post(
-        f"https://api.trello.com/1/cards/{card_id}/checklists",
-        params={
-            "key": API_KEY,
-            "token": TOKEN,
-            "name": card_name
-        }
-    ).raise_for_status()
-
-    existing_cards.add((list_id, card_name.lower()))
+    card_ids_by_location[card_key] = response.json()["id"]
+    print(f"Created card '{card_name}' in '{list_name}'.")
 
 # ==============================================================================================
-# Adding checklist items to the cards.
+# Create checklists and checklist items.
 # ==============================================================================================
 
-# Get a list of all checklists and their ids. 
-response = requests.get(
-    f"https://api.trello.com/1/boards/{board_id}/cards",
-    params={
-        "key": API_KEY,
-        "token": TOKEN,
-        "checklists": "all"
-    }
-)
-response.raise_for_status()
+# The script uses one checklist per card, with the checklist named after the card.
+source_cards = {}
 
-cards = response.json()
+for row_number, row in workplan_df.iterrows():
+    list_name_value = row["LIST NAME"]
+    card_name_value = row["CARD NAME"]
 
-# Create a dictionary of that looks like { (Card_Name, Checklist_Name): Checklist_ID }. Used to determine the checklist the item should be assigned to. 
-checklist_dict = {
-    (card["name"].lower(), checklist["name"].lower()): checklist["id"]
-    for card in cards
-    for checklist in card.get("checklists", [])
-}
-
-# Loops through the workplan and add checklist items. 
-for _, row in workplan_df.iterrows():
-    card_name = row["CARD NAME"]
-    checklist_item = row["CHECKLIST ITEM DESCRIPTION"]
-    due_date_raw = pd.to_datetime(row["CHECKLIST ITEM DUE DATE"], errors="coerce")
-    assignee = row["CHECKLIST ITEM ASSIGNMENT"]
-
-    if pd.isna(card_name) or pd.isna(checklist_item):
+    if (
+        pd.isna(list_name_value)
+        or not str(list_name_value).strip()
+        or pd.isna(card_name_value)
+        or not str(card_name_value).strip()
+    ):
         continue
 
-    checklist_id = checklist_dict.get((card_name.lower().strip(), card_name.lower().strip()))
+    list_name = str(list_name_value).strip()
+    card_name = str(card_name_value).strip()
+    list_id = list_dict[normalize_name(list_name)]
+    card_key = (list_id, normalize_name(card_name))
+    card_id = card_ids_by_location.get(card_key)
 
+    if card_id is None:
+        raise RuntimeError(
+            f"Could not find Trello card '{card_name}' in list '{list_name}'."
+        )
+
+    source_cards[card_key] = {
+        "card_id": card_id,
+        "card_name": card_name,
+        "list_name": list_name,
+    }
+
+
+try:
     response = requests.get(
-        f"https://api.trello.com/1/checklists/{checklist_id}/checkItems",
+        f"{TRELLO_API_BASE}/boards/{board_id}/cards",
         params={
-            "key": API_KEY,
-            "token": TOKEN,
-        }
+            **TRELLO_AUTH,
+            "checklists": "all",
+        },
+        timeout=30,
     )
     response.raise_for_status()
+except requests.RequestException as error:
+    raise RuntimeError(
+        f"Unable to retrieve checklists for board '{new_board_name}'."
+    ) from error
 
-    existing_checklist_items = {
-        item["name"]
+checklist_ids_by_card_key = {}
+
+for card in response.json():
+    card_key = (
+        card["idList"],
+        normalize_name(card["name"]),
+    )
+
+    matching_checklists = [
+        checklist
+        for checklist in card.get("checklists", [])
+        if normalize_name(checklist["name"]) == normalize_name(card["name"])
+    ]
+
+    if len(matching_checklists) > 1:
+        raise RuntimeError(
+            f"Card '{card['name']}' has multiple checklists with the same name."
+        )
+
+    if matching_checklists:
+        checklist_ids_by_card_key[card_key] = matching_checklists[0]["id"]
+
+
+# Create a checklist for each workplan card when one does not already exist.
+for card_key, card_details in source_cards.items():
+    if card_key in checklist_ids_by_card_key:
+        continue
+
+    try:
+        response = requests.post(
+            f"{TRELLO_API_BASE}/cards/{card_details['card_id']}/checklists",
+            params={
+                **TRELLO_AUTH,
+                "name": card_details["card_name"],
+            },
+            timeout=30,
+        )
+        response.raise_for_status()
+    except requests.RequestException as error:
+        raise RuntimeError(
+            f"Unable to create a checklist for card "
+            f"'{card_details['card_name']}'."
+        ) from error
+
+    checklist_ids_by_card_key[card_key] = response.json()["id"]
+
+    print(
+        f"Created checklist for card '{card_details['card_name']}' "
+        f"in '{card_details['list_name']}'."
+    )
+
+
+# Fetch existing checklist items once per checklist.
+existing_checklist_items = {}
+
+for checklist_id in checklist_ids_by_card_key.values():
+    try:
+        response = requests.get(
+            f"{TRELLO_API_BASE}/checklists/{checklist_id}/checkItems",
+            params=TRELLO_AUTH,
+            timeout=30,
+        )
+        response.raise_for_status()
+    except requests.RequestException as error:
+        raise RuntimeError(
+            f"Unable to retrieve items for checklist '{checklist_id}'."
+        ) from error
+
+    existing_checklist_items[checklist_id] = {
+        normalize_name(item["name"])
         for item in response.json()
     }
 
 
-    if checklist_id is None:
-        print(f"Checklist for card '{card_name}' not found. Skipping checklist item '{checklist_item}'.")
+for row_number, row in workplan_df.iterrows():
+    spreadsheet_row = row_number + 2
+    checklist_item_value = row["CHECKLIST ITEM DESCRIPTION"]
+
+    if pd.isna(checklist_item_value) or not str(checklist_item_value).strip():
         continue
 
-    if checklist_item in existing_checklist_items:
-        print(f"A checklist item with the name '{checklist_item}' already exists in the checklist for card '{card_name}'. Skipping.")
+    list_name = str(row["LIST NAME"]).strip()
+    card_name = str(row["CARD NAME"]).strip()
+    checklist_item = str(checklist_item_value).strip()
+
+    list_id = list_dict[normalize_name(list_name)]
+    card_key = (list_id, normalize_name(card_name))
+    checklist_id = checklist_ids_by_card_key[card_key]
+    checklist_item_key = normalize_name(checklist_item)
+
+    if checklist_item_key in existing_checklist_items[checklist_id]:
+        print(
+            f"Checklist item '{checklist_item}' already exists on "
+            f"card '{card_name}'."
+        )
         continue
 
-    if pd.notna(due_date_raw):
-        due_date = due_date_raw.tz_localize("UTC").isoformat().replace("+00:00", "Z")
-    else:
-        due_date = None
-
-    assigned_member = member_dict.get(assignee.lower().strip())
-
-    response = requests.post(
-        f"https://api.trello.com/1/checklists/{checklist_id}/checkItems",
-        params={
-            "key": API_KEY,
-            "token": TOKEN,
-            "name":  checklist_item,
-            "due": due_date,
-            "idMember": assigned_member if assigned_member is not None else ""
-        },
+    due_date = to_trello_timestamp(
+        row["CHECKLIST ITEM DUE DATE"],
+        spreadsheet_row,
+        "CHECKLIST ITEM DUE DATE",
     )
-    response.raise_for_status()
 
-    item_card_id = card_dict.get(card_name.strip().lower())
+    assignee_value = row["CHECKLIST ITEM ASSIGNMENT"]
+    assigned_member_id = None
 
-    check_item_id = response.json()["id"]
+    if pd.notna(assignee_value) and str(assignee_value).strip():
+        assignee_name = str(assignee_value).strip()
+        assigned_member_id = workspace_members_by_name.get(
+            normalize_name(assignee_name)
+        )
 
+        if assigned_member_id is None:
+            print(
+                f"Row {spreadsheet_row}: checklist assignee '{assignee_name}' "
+                "was not found in the workspace. Creating the item unassigned."
+            )
 
+    checklist_item_params = {
+        **TRELLO_AUTH,
+        "name": checklist_item,
+    }
 
-    existing_checklist_items.add((checklist_id, checklist_item.lower()))
+    if due_date:
+        checklist_item_params["due"] = due_date
 
+    if assigned_member_id:
+        checklist_item_params["idMember"] = assigned_member_id
+
+    try:
+        response = requests.post(
+            f"{TRELLO_API_BASE}/checklists/{checklist_id}/checkItems",
+            params=checklist_item_params,
+            timeout=30,
+        )
+        response.raise_for_status()
+    except requests.RequestException as error:
+        raise RuntimeError(
+            f"Unable to create checklist item '{checklist_item}' "
+            f"for card '{card_name}'."
+        ) from error
+
+    existing_checklist_items[checklist_id].add(checklist_item_key)
+
+    print(f"Created checklist item '{checklist_item}' for card '{card_name}'.")
     
 
 
 
-print("New board and lists ready.")
+print("Workplan import complete.")
 
 
 
