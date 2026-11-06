@@ -35,7 +35,7 @@ if missing_environment_variables:
 workplan_file = Path(
     os.getenv(
         "WORKPLAN_FILE",
-        r"C:\Users\tpeterschmidt\Documents\Test_workplan_copy.xlsx",
+        r"C:\Users\tpeterschmidt\OneDrive - PSMFC\Documents\Test_workplan_copy.xlsx",
     )
 )
 sheet_name = os.getenv("WORKPLAN_SHEET", "Test Trello Version")
